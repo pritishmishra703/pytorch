@@ -213,98 +213,11 @@ class ProcessGroupNCCL : public ProcessGroup {
         at::IValue value,
         std::shared_ptr<std::vector<at::cuda::CUDAEvent>> cudaEvents)
         : at::ivalue::Future(c10::ListType::create(c10::TensorType::get())),
-          value_(std::move(value)),
           cudaEvents_(std::move(cudaEvents)) {
+      markCompleted(std::move(value));
     }
 
-    FutureNCCL(at::TypePtr type) : at::ivalue::Future(std::move(type)) {}
-
-    // Gets the current stream of the device and synchronizes recorded streams
-    // with that. It will return after synchronizing the correct GPU streams to
-    // ensure we can have async CUDA execution and it does not wait for the
-    // entire operation to complete on GPU.
-    void wait() override {
-      if (error_) {
-        throw *error_;
-      }
-
-      postWaitHook();
-    }
-
-    // If FutureNCCL was created by FutureNCCL::then, its value would be empty
-    // initially. FutureNCCL::then will later use this method to set its value
-    // to the return value of the callback.
-    void markCompleted(at::IValue value) override {
-      TORCH_INTERNAL_ASSERT(
-          value_.isNone(),
-          "Attempting to set value of a FutureNCCL which has a value."
-          "FutureNCCL's value was internally set to NCCL collective's "
-          "outputs or the return value of the callback.");
-      value_ = std::move(value);
-
-      postMarkCompletedHook();
-    }
-
-    // Just returns FutureNCCL's value after wait returns.
-    at::IValue value() override {
-      TORCH_INTERNAL_ASSERT(hasValue(), "FutureNCCL's value is None.")
-      wait();
-      return value_;
-    }
-
-    const at::IValue& constValue() override {
-      TORCH_INTERNAL_ASSERT(hasValue(), "FutureNCCL's value is None.")
-      wait();
-      return value_;
-    }
-
-    // Adds a callback to FutureNCCL. It invokes the callback inline after
-    // synchronizing FutureNCCL's own cudaEvents with the stream that runs
-    // this callback. This new FutureNCCL's cudaEvents will record the
-    // callback's stream and will have the result value of the callback.
-    void addCallback(std::function<void(void)> callback) override {
-      std::function<void(void)> wrappedCallback =
-          wrapCallback(std::move(callback));
-      wrappedCallback();
-    }
-
-    // Adds a callback to FutureNCCL, and returns another FutureNCCL to hold
-    // the return value of the callback and new cudaEvents that recorded the
-    // stream that runs this callback.
-    c10::intrusive_ptr<Future> then(
-        std::function<at::IValue(void)> callback,
-        at::TypePtr type) override {
-      auto fut = c10::make_intrusive<FutureNCCL>(std::move(type));
-      // The new future needs the DataPtr extractor when it gets marked complete
-      // but this might happen immediately inline or in parallel by another
-      // thread. In both these cases this would/might happen before the user has
-      // time to set their own DataPtr extractor, which might lead to failures
-      // if the default extractor can't handle some of the user's types.
-      // Therefore we propagate our extractor.
-      fut->setDataPtrExtractor(dataPtrExtractor_);
-
-      // Cannot move capture std::function in lambda, because it cannot deduce
-      // the template type for std::function. Hence use std::bind to explicitly
-      // specify types.
-      addCallback(std::bind(
-          [&](std::function<at::IValue(void)> cb) {
-            try {
-              fut->markCompleted(at::IValue(cb()));
-            } catch (const std::exception& e) {
-              fut->setError(std::current_exception());
-            }
-          },
-          std::move(callback)));
-      return fut;
-    }
-
-    bool completed() const override {
-      return true;
-    }
-
-    bool hasValue() const override {
-      return !value_.isNone();
-    }
+    using at::ivalue::Future::Future;
 
     void setDataPtrExtractor(DataPtrExtractor data_ptr_extractor) override {
       // To avoid races with other threads that may be using the extractor, we
@@ -315,10 +228,22 @@ class ProcessGroupNCCL : public ProcessGroup {
     }
 
    protected:
-    void postMarkCompletedHook() {
+    c10::intrusive_ptr<Future> createInstance(at::TypePtr type) override {
+      auto fut = c10::make_intrusive<FutureNCCL>(std::move(type));
+      // The new future needs the DataPtr extractor when it gets marked complete
+      // but this might happen immediately inline or in parallel by another
+      // thread. In both these cases this would/might happen before the user has
+      // time to set their own DataPtr extractor, which might lead to failures
+      // if the default extractor can't handle some of the user's types.
+      // Therefore we propagate our extractor.
+      fut->setDataPtrExtractor(dataPtrExtractor_);
+      return fut;
+    }
+
+    void postMarkCompletedHook(const at::IValue& value) override {
       if (cudaEvents_ == nullptr) {
         std::vector<bool> isCudaDeviceUsed(c10::cuda::device_count(), false);
-        for (const at::DataPtr& data_ptr : extractDataPtrs(value_)) {
+        for (const at::DataPtr& data_ptr : extractDataPtrs(value)) {
           if (data_ptr.device().is_cuda()) {
             isCudaDeviceUsed[data_ptr.device().index()] = true;
           }
@@ -335,7 +260,7 @@ class ProcessGroupNCCL : public ProcessGroup {
       }
     }
 
-    std::function<void(void)> wrapCallback(std::function<void(void)> callback) {
+    std::function<void(void)> wrapCallback(std::function<void(void)> callback) override {
       return [this, callback{std::move(callback)}]() {
         // Get a stream for all devices, even those that are not used by the
         // value, because the user's callback could use those other devices.
@@ -349,7 +274,7 @@ class ProcessGroupNCCL : public ProcessGroup {
 
         // Do not free the underlying data storage of value_ before its
         // usage on the stream finishes.
-        for (const at::DataPtr& data_ptr : extractDataPtrs(value_)) {
+        for (const at::DataPtr& data_ptr : extractDataPtrs(constValue())) {
           if (data_ptr.device().is_cuda()) {
             c10::cuda::CUDACachingAllocator::recordStream(
                 data_ptr, streams[data_ptr.device().index()]);
@@ -367,7 +292,7 @@ class ProcessGroupNCCL : public ProcessGroup {
       };
     }
 
-    void postWaitHook() {
+    void postWaitHook() override {
       for (at::cuda::CUDAEvent& cudaEvent : *cudaEvents_) {
         cudaEvent.block(
             at::cuda::getCurrentCUDAStream(cudaEvent.device_index()));
@@ -375,10 +300,8 @@ class ProcessGroupNCCL : public ProcessGroup {
     }
 
    private:
-    at::IValue value_;
     std::shared_ptr<std::vector<at::cuda::CUDAEvent>> cudaEvents_;
     DataPtrExtractor dataPtrExtractor_;
-    c10::optional<FutureError> error_;
 
     std::vector<std::reference_wrapper<const at::DataPtr>> extractDataPtrs(
         const at::IValue& value) {
